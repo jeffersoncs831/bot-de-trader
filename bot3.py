@@ -5,11 +5,11 @@ import numpy as np
 import time
 
 # === CONFIGURAÇÕES DO ROBÔ ===
-TOKEN = "VjNovR9q9lnDX3q"  # <--- Substitua pelo seu token demo
-STAKE = 10.0                  # Valor da ordem em dólares
-META_LUCRO = 100.0             # Meta de lucro diário (positivo)
-STOP_LOSS = 50.0              # Limite de perda diária (positivo)
-SIMBOLO = "R_100"              # Ativo a operar
+TOKEN = "VjNovR9q9lnDX3q"
+STAKE = 1.0
+META_LUCRO = 15.0
+STOP_LOSS = 5.0
+SIMBOLO = "R_100"
 
 # === VARIÁVEIS GLOBAIS ===
 lucro_total = 0
@@ -18,6 +18,8 @@ ws = None
 ordem_em_andamento = False
 ultimo_contract_id = None
 tipo_ordem_atual = ""
+ultimo_trade_time = 0
+cooldown = 5  # segundos
 
 # === INDICADORES ===
 def calculate_ema(series, period):
@@ -30,11 +32,20 @@ def calculate_rsi(series, period=14):
     rs = ganho / perda
     return 100 - (100 / (1 + rs))
 
-# === DECISÃO DE ENTRADA ===
-def decide_trade(preco, ema, rsi):
-    if preco > ema and rsi < 60:
+# === LÓGICA DE ENTRADA COM EMA + RSI ===
+def decide_trade_ema_rsi(series):
+    ema_curta = calculate_ema(series, 5)
+    ema_longa = calculate_ema(series, 20)
+    rsi = calculate_rsi(series, 14)
+
+    cruzou_para_cima = ema_curta.iloc[-2] < ema_longa.iloc[-2] and ema_curta.iloc[-1] > ema_longa.iloc[-1]
+    cruzou_para_baixo = ema_curta.iloc[-2] > ema_longa.iloc[-2] and ema_curta.iloc[-1] < ema_longa.iloc[-1]
+
+    rsi_atual = rsi.iloc[-1]
+
+    if cruzou_para_cima and rsi_atual < 70:
         return "CALL"
-    elif preco < ema and rsi > 40:
+    elif cruzou_para_baixo and rsi_atual > 30:
         return "PUT"
     return "SEM ENTRADA"
 
@@ -46,9 +57,10 @@ def salvar_resultado(ativo, tipo, resultado, lucro):
 
 # === ENVIAR ORDEM ===
 def enviar_ordem_real(tipo_ordem):
-    global ordem_em_andamento, tipo_ordem_atual
+    global ordem_em_andamento, tipo_ordem_atual, ultimo_trade_time
     tipo_ordem_atual = tipo_ordem
     ordem_em_andamento = True
+    ultimo_trade_time = time.time()
     print(f"\n📤 Enviando ORDEM REAL: {tipo_ordem} | Valor: R${STAKE:.2f}")
     contrato = {
         "buy": 1,
@@ -75,29 +87,25 @@ def consultar_contrato(contract_id):
 
 # === AO RECEBER MENSAGEM ===
 def on_message(wsapp, message):
-    global precos, lucro_total, ordem_em_andamento, ultimo_contract_id
+    global precos, lucro_total, ordem_em_andamento, ultimo_contract_id, ultimo_trade_time
 
     data = json.loads(message)
 
-    # Checa META DE LUCRO
     if lucro_total >= META_LUCRO:
         print("\n🏁 META DE LUCRO ALCANÇADA! Encerrando robô.")
         wsapp.close()
         return
 
-    # Checa STOP LOSS
     if lucro_total <= -abs(STOP_LOSS):
         print("\n🛑 STOP LOSS atingido! Encerrando robô.")
         wsapp.close()
         return
 
-    # Autorizado
     if data.get("msg_type") == "authorize":
         print("✅ Autenticado com sucesso. Coletando dados...")
         wsapp.send(json.dumps({"ticks": SIMBOLO}))
         return
 
-    # Ordem de compra enviada
     if data.get("msg_type") == "buy":
         ultimo_contract_id = data["buy"]["contract_id"]
         print("📨 Contrato enviado. Aguardando resultado...")
@@ -105,7 +113,6 @@ def on_message(wsapp, message):
         consultar_contrato(ultimo_contract_id)
         return
 
-    # Resultado da ordem
     if data.get("msg_type") == "proposal_open_contract":
         contrato = data["proposal_open_contract"]
         if contrato["is_sold"]:
@@ -120,7 +127,6 @@ def on_message(wsapp, message):
             consultar_contrato(ultimo_contract_id)
         return
 
-    # Recebe tick de preço
     if "tick" in data and not ordem_em_andamento:
         preco = float(data["tick"]["quote"])
         precos.append(preco)
@@ -128,11 +134,9 @@ def on_message(wsapp, message):
         if len(precos) >= 50:
             precos = precos[-50:]
             serie = pd.Series(precos)
-            ema = calculate_ema(serie, 14).iloc[-1]
-            rsi = calculate_rsi(serie, 14).iloc[-1]
-            decisao = decide_trade(preco, ema, rsi)
-            print(f"📊 Preço: {preco:.2f} | EMA: {ema:.2f} | RSI: {rsi:.2f} → {decisao}")
-            if decisao in ["CALL", "PUT"]:
+            decisao = decide_trade_ema_rsi(serie)
+            print(f"📊 Preço: {preco:.2f} → {decisao}")
+            if decisao in ["CALL", "PUT"] and time.time() - ultimo_trade_time >= cooldown:
                 enviar_ordem_real(decisao)
         else:
             print(f"⏳ Coletando dados... ({len(precos)}/50)")
